@@ -217,6 +217,374 @@ func TestAgentLoop_EmitsMinimalTurnEvents(t *testing.T) {
 	}
 }
 
+func TestAgentLoop_EmitsSteeringAndSkippedToolEvents(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "agent-eventbus-steering-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+
+	tool1ExecCh := make(chan struct{})
+	tool1 := &slowTool{name: "tool_one", duration: 50 * time.Millisecond, execCh: tool1ExecCh}
+	tool2 := &slowTool{name: "tool_two", duration: 50 * time.Millisecond}
+
+	provider := &toolCallProvider{
+		toolCalls: []providers.ToolCall{
+			{
+				ID:   "call_1",
+				Type: "function",
+				Name: "tool_one",
+				Function: &providers.FunctionCall{
+					Name:      "tool_one",
+					Arguments: "{}",
+				},
+				Arguments: map[string]any{},
+			},
+			{
+				ID:   "call_2",
+				Type: "function",
+				Name: "tool_two",
+				Function: &providers.FunctionCall{
+					Name:      "tool_two",
+					Arguments: "{}",
+				},
+				Arguments: map[string]any{},
+			},
+		},
+		finalResp: "steered response",
+	}
+
+	msgBus := bus.NewMessageBus()
+	al := NewAgentLoop(cfg, msgBus, provider)
+	al.RegisterTool(tool1)
+	al.RegisterTool(tool2)
+
+	sub := al.SubscribeEvents(32)
+	defer al.UnsubscribeEvents(sub.ID)
+
+	resultCh := make(chan string, 1)
+	go func() {
+		resp, _ := al.ProcessDirectWithChannel(context.Background(), "do something", "test-session", "test", "chat1")
+		resultCh <- resp
+	}()
+
+	select {
+	case <-tool1ExecCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for tool_one to start")
+	}
+
+	if err := al.Steer(providers.Message{Role: "user", Content: "change course"}); err != nil {
+		t.Fatalf("Steer failed: %v", err)
+	}
+
+	select {
+	case resp := <-resultCh:
+		if resp != "steered response" {
+			t.Fatalf("expected steered response, got %q", resp)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for steered response")
+	}
+
+	events := collectEventStream(sub.C)
+	steeringEvt, ok := findEvent(events, EventKindSteeringInjected)
+	if !ok {
+		t.Fatal("expected steering injected event")
+	}
+	steeringPayload, ok := steeringEvt.Payload.(SteeringInjectedPayload)
+	if !ok {
+		t.Fatalf("expected SteeringInjectedPayload, got %T", steeringEvt.Payload)
+	}
+	if steeringPayload.Count != 1 {
+		t.Fatalf("expected 1 steering message, got %d", steeringPayload.Count)
+	}
+
+	skippedEvt, ok := findEvent(events, EventKindToolExecSkipped)
+	if !ok {
+		t.Fatal("expected skipped tool event")
+	}
+	skippedPayload, ok := skippedEvt.Payload.(ToolExecSkippedPayload)
+	if !ok {
+		t.Fatalf("expected ToolExecSkippedPayload, got %T", skippedEvt.Payload)
+	}
+	if skippedPayload.Tool != "tool_two" {
+		t.Fatalf("expected skipped tool_two, got %q", skippedPayload.Tool)
+	}
+
+	interruptEvt, ok := findEvent(events, EventKindInterruptReceived)
+	if !ok {
+		t.Fatal("expected interrupt received event")
+	}
+	interruptPayload, ok := interruptEvt.Payload.(InterruptReceivedPayload)
+	if !ok {
+		t.Fatalf("expected InterruptReceivedPayload, got %T", interruptEvt.Payload)
+	}
+	if interruptPayload.Role != "user" {
+		t.Fatalf("expected interrupt role user, got %q", interruptPayload.Role)
+	}
+	if interruptPayload.ContentLen != len("change course") {
+		t.Fatalf("expected interrupt content len %d, got %d", len("change course"), interruptPayload.ContentLen)
+	}
+}
+
+func TestAgentLoop_EmitsContextCompressEventOnRetry(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "agent-eventbus-compress-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+
+	contextErr := errString("InvalidParameter: Total tokens of image and text exceed max message tokens")
+	provider := &failFirstMockProvider{
+		failures:    1,
+		failError:   contextErr,
+		successResp: "Recovered from context error",
+	}
+	msgBus := bus.NewMessageBus()
+	al := NewAgentLoop(cfg, msgBus, provider)
+	defaultAgent := al.registry.GetDefaultAgent()
+	if defaultAgent == nil {
+		t.Fatal("expected default agent")
+	}
+
+	defaultAgent.Sessions.SetHistory("session-1", []providers.Message{
+		{Role: "user", Content: "Old message 1"},
+		{Role: "assistant", Content: "Old response 1"},
+		{Role: "user", Content: "Old message 2"},
+		{Role: "assistant", Content: "Old response 2"},
+		{Role: "user", Content: "Trigger message"},
+	})
+
+	sub := al.SubscribeEvents(16)
+	defer al.UnsubscribeEvents(sub.ID)
+
+	resp, err := al.runAgentLoop(context.Background(), defaultAgent, processOptions{
+		SessionKey:      "session-1",
+		Channel:         "cli",
+		ChatID:          "direct",
+		UserMessage:     "Trigger message",
+		DefaultResponse: defaultResponse,
+		EnableSummary:   false,
+		SendResponse:    false,
+	})
+	if err != nil {
+		t.Fatalf("runAgentLoop failed: %v", err)
+	}
+	if resp != "Recovered from context error" {
+		t.Fatalf("expected retry success, got %q", resp)
+	}
+
+	events := collectEventStream(sub.C)
+	retryEvt, ok := findEvent(events, EventKindLLMRetry)
+	if !ok {
+		t.Fatal("expected llm retry event")
+	}
+	retryPayload, ok := retryEvt.Payload.(LLMRetryPayload)
+	if !ok {
+		t.Fatalf("expected LLMRetryPayload, got %T", retryEvt.Payload)
+	}
+	if retryPayload.Reason != "context_limit" {
+		t.Fatalf("expected context_limit retry reason, got %q", retryPayload.Reason)
+	}
+	if retryPayload.Attempt != 1 {
+		t.Fatalf("expected retry attempt 1, got %d", retryPayload.Attempt)
+	}
+
+	compressEvt, ok := findEvent(events, EventKindContextCompress)
+	if !ok {
+		t.Fatal("expected context compress event")
+	}
+	payload, ok := compressEvt.Payload.(ContextCompressPayload)
+	if !ok {
+		t.Fatalf("expected ContextCompressPayload, got %T", compressEvt.Payload)
+	}
+	if payload.Reason != ContextCompressReasonRetry {
+		t.Fatalf("expected retry compress reason, got %q", payload.Reason)
+	}
+	if payload.DroppedMessages == 0 {
+		t.Fatal("expected dropped messages to be recorded")
+	}
+}
+
+func TestAgentLoop_EmitsSessionSummarizeEvent(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "agent-eventbus-summary-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:                 tmpDir,
+				Model:                     "test-model",
+				MaxTokens:                 4096,
+				MaxToolIterations:         10,
+				ContextWindow:             8000,
+				SummarizeMessageThreshold: 2,
+				SummarizeTokenPercent:     75,
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	al := NewAgentLoop(cfg, msgBus, &simpleMockProvider{response: "summary text"})
+	defaultAgent := al.registry.GetDefaultAgent()
+	if defaultAgent == nil {
+		t.Fatal("expected default agent")
+	}
+
+	defaultAgent.Sessions.SetHistory("session-1", []providers.Message{
+		{Role: "user", Content: "Question one"},
+		{Role: "assistant", Content: "Answer one"},
+		{Role: "user", Content: "Question two"},
+		{Role: "assistant", Content: "Answer two"},
+		{Role: "user", Content: "Question three"},
+		{Role: "assistant", Content: "Answer three"},
+	})
+
+	sub := al.SubscribeEvents(16)
+	defer al.UnsubscribeEvents(sub.ID)
+
+	turnScope := al.newTurnEventScope(defaultAgent.ID, "session-1")
+	al.summarizeSession(defaultAgent, "session-1", turnScope)
+
+	events := collectEventStream(sub.C)
+	summaryEvt, ok := findEvent(events, EventKindSessionSummarize)
+	if !ok {
+		t.Fatal("expected session summarize event")
+	}
+	payload, ok := summaryEvt.Payload.(SessionSummarizePayload)
+	if !ok {
+		t.Fatalf("expected SessionSummarizePayload, got %T", summaryEvt.Payload)
+	}
+	if payload.SummaryLen == 0 {
+		t.Fatal("expected non-empty summary length")
+	}
+}
+
+func TestAgentLoop_EmitsFollowUpQueuedEvent(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "agent-eventbus-followup-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				Model:             "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+
+	provider := &toolCallProvider{
+		toolCalls: []providers.ToolCall{
+			{
+				ID:   "call_async_1",
+				Type: "function",
+				Name: "async_followup",
+				Function: &providers.FunctionCall{
+					Name:      "async_followup",
+					Arguments: "{}",
+				},
+				Arguments: map[string]any{},
+			},
+		},
+		finalResp: "async launched",
+	}
+
+	msgBus := bus.NewMessageBus()
+	al := NewAgentLoop(cfg, msgBus, provider)
+	doneCh := make(chan struct{})
+	al.RegisterTool(&asyncFollowUpTool{
+		name:          "async_followup",
+		followUpText:  "background result",
+		completionSig: doneCh,
+	})
+	defaultAgent := al.registry.GetDefaultAgent()
+	if defaultAgent == nil {
+		t.Fatal("expected default agent")
+	}
+
+	sub := al.SubscribeEvents(32)
+	defer al.UnsubscribeEvents(sub.ID)
+
+	resp, err := al.runAgentLoop(context.Background(), defaultAgent, processOptions{
+		SessionKey:      "session-1",
+		Channel:         "cli",
+		ChatID:          "direct",
+		UserMessage:     "run async tool",
+		DefaultResponse: defaultResponse,
+		EnableSummary:   false,
+		SendResponse:    false,
+	})
+	if err != nil {
+		t.Fatalf("runAgentLoop failed: %v", err)
+	}
+	if resp != "async launched" {
+		t.Fatalf("expected final response 'async launched', got %q", resp)
+	}
+
+	select {
+	case <-doneCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for async tool completion")
+	}
+
+	followUpEvt := waitForEvent(t, sub.C, 2*time.Second, func(evt Event) bool {
+		return evt.Kind == EventKindFollowUpQueued
+	})
+	payload, ok := followUpEvt.Payload.(FollowUpQueuedPayload)
+	if !ok {
+		t.Fatalf("expected FollowUpQueuedPayload, got %T", followUpEvt.Payload)
+	}
+	if payload.SourceTool != "async_followup" {
+		t.Fatalf("expected source tool async_followup, got %q", payload.SourceTool)
+	}
+	if payload.Channel != "cli" {
+		t.Fatalf("expected channel cli, got %q", payload.Channel)
+	}
+	if payload.ChatID != "direct" {
+		t.Fatalf("expected chat id direct, got %q", payload.ChatID)
+	}
+	if payload.ContentLen != len("background result") {
+		t.Fatalf("expected content len %d, got %d", len("background result"), payload.ContentLen)
+	}
+	if followUpEvt.Meta.SessionKey != "session-1" {
+		t.Fatalf("expected session key session-1, got %q", followUpEvt.Meta.SessionKey)
+	}
+	if followUpEvt.Meta.TurnID == "" {
+		t.Fatal("expected follow-up event to include turn id")
+	}
+}
+
 func collectEventStream(ch <-chan Event) []Event {
 	var events []Event
 	for {
@@ -232,4 +600,80 @@ func collectEventStream(ch <-chan Event) []Event {
 	}
 }
 
+func waitForEvent(t *testing.T, ch <-chan Event, timeout time.Duration, match func(Event) bool) Event {
+	t.Helper()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case evt, ok := <-ch:
+			if !ok {
+				t.Fatal("event stream closed before expected event arrived")
+			}
+			if match(evt) {
+				return evt
+			}
+		case <-timer.C:
+			t.Fatal("timed out waiting for expected event")
+		}
+	}
+}
+
+func findEvent(events []Event, kind EventKind) (Event, bool) {
+	for _, evt := range events {
+		if evt.Kind == kind {
+			return evt, true
+		}
+	}
+	return Event{}, false
+}
+
+type errString string
+
+func (e errString) Error() string {
+	return string(e)
+}
+
+type asyncFollowUpTool struct {
+	name          string
+	followUpText  string
+	completionSig chan struct{}
+}
+
+func (t *asyncFollowUpTool) Name() string {
+	return t.name
+}
+
+func (t *asyncFollowUpTool) Description() string {
+	return "async follow-up tool for testing"
+}
+
+func (t *asyncFollowUpTool) Parameters() map[string]any {
+	return map[string]any{
+		"type":       "object",
+		"properties": map[string]any{},
+	}
+}
+
+func (t *asyncFollowUpTool) Execute(ctx context.Context, args map[string]any) *tools.ToolResult {
+	return tools.AsyncResult("async follow-up scheduled")
+}
+
+func (t *asyncFollowUpTool) ExecuteAsync(
+	ctx context.Context,
+	args map[string]any,
+	cb tools.AsyncCallback,
+) *tools.ToolResult {
+	go func() {
+		cb(ctx, &tools.ToolResult{ForLLM: t.followUpText})
+		if t.completionSig != nil {
+			close(t.completionSig)
+		}
+	}()
+	return tools.AsyncResult("async follow-up scheduled")
+}
+
 var _ tools.Tool = (*mockCustomTool)(nil)
+var _ tools.AsyncExecutor = (*asyncFollowUpTool)(nil)
