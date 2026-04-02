@@ -1,10 +1,14 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"runtime"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/sipeed/picoclaw/pkg/config"
 )
@@ -162,9 +166,17 @@ func (h *Handler) handleListTools(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	items := buildToolSupport(cfg)
+
+	// [aimemkb-patch: list-mcp-tools-in-web-ui]
+	// Append tools from configured MCP servers so they appear on the Tools page.
+	if cfg.Tools.MCP.Enabled {
+		items = append(items, fetchMCPServerTools(cfg.Tools.MCP)...)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(toolSupportResponse{
-		Tools: buildToolSupport(cfg),
+		Tools: items,
 	})
 }
 
@@ -265,6 +277,101 @@ func resolveDiscoveryToolSupport(cfg *config.Config, methodEnabled bool) (string
 		return "disabled", ""
 	}
 	return "enabled", ""
+}
+
+// fetchMCPServerTools connects to each enabled MCP server (HTTP/SSE only),
+// lists its tools, and returns them as toolSupportItems.
+// [aimemkb-patch: list-mcp-tools-in-web-ui]
+func fetchMCPServerTools(mcpCfg config.MCPConfig) []toolSupportItem {
+	var items []toolSupportItem
+
+	for serverName, serverCfg := range mcpCfg.Servers {
+		if !serverCfg.Enabled || serverCfg.URL == "" {
+			continue
+		}
+
+		tools, err := listToolsFromMCPServer(serverCfg)
+		if err != nil {
+			// Server unreachable — add a single placeholder entry
+			items = append(items, toolSupportItem{
+				Name:        serverName,
+				Description: fmt.Sprintf("MCP server unreachable: %v", err),
+				Category:    "mcp:" + serverName,
+				Status:      "blocked",
+				ReasonCode:  "mcp_server_error",
+			})
+			continue
+		}
+
+		for _, t := range tools {
+			items = append(items, toolSupportItem{
+				Name:        t.Name,
+				Description: t.Description,
+				Category:    "mcp:" + serverName,
+				Status:      "enabled",
+			})
+		}
+	}
+
+	return items
+}
+
+// listToolsFromMCPServer connects to a single MCP server and returns its tool list.
+func listToolsFromMCPServer(cfg config.MCPServerConfig) ([]*mcp.Tool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client := mcp.NewClient(&mcp.Implementation{
+		Name:    "picoclaw-webui",
+		Version: "1.0.0",
+	}, nil)
+
+	transport := &mcp.StreamableClientTransport{
+		Endpoint:             cfg.URL,
+		DisableStandaloneSSE: true,
+	}
+	if len(cfg.Headers) > 0 {
+		transport.HTTPClient = &http.Client{
+			Transport: &headerTransport{
+				base:    http.DefaultTransport,
+				headers: cfg.Headers,
+			},
+		}
+	}
+
+	session, err := client.Connect(ctx, transport, nil)
+	if err != nil {
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+	defer session.Close()
+
+	var tools []*mcp.Tool
+	for tool, err := range session.Tools(ctx, nil) {
+		if err != nil {
+			continue
+		}
+		tools = append(tools, tool)
+	}
+	return tools, nil
+}
+
+// headerTransport adds custom headers to HTTP requests.
+// Duplicated from pkg/mcp/manager.go to avoid import cycle.
+type headerTransport struct {
+	base    http.RoundTripper
+	headers map[string]string
+}
+
+func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	for key, value := range t.headers {
+		req.Header.Set(key, value)
+	}
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(req)
 }
 
 func applyToolState(cfg *config.Config, toolName string, enabled bool) error {

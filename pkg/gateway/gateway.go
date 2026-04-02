@@ -63,6 +63,18 @@ type services struct {
 	reloading        atomic.Bool
 }
 
+// InterruptFunc holds the agent loop's InterruptHard function.
+// Set automatically when the gateway starts. External callers (e.g. aimemkb)
+// can invoke this to abort the currently running agent turn.
+// [aimemkb-patch: export-interrupt-func]
+var InterruptFunc func() error
+
+// RegisterToolFunc holds a function that registers a tool into the gateway's
+// agent loop. Set automatically when the gateway starts. External callers
+// (e.g. aimemkb) can invoke this to register custom built-in tools.
+// [aimemkb-patch: export-register-tool-func]
+var RegisterToolFunc func(tool tools.Tool)
+
 type startupBlockedProvider struct {
 	reason string
 }
@@ -118,6 +130,10 @@ func Run(debug bool, homePath, configPath string, allowEmptyStartup bool) error 
 
 	msgBus := bus.NewMessageBus()
 	agentLoop := agent.NewAgentLoop(cfg, msgBus, provider)
+	// [aimemkb-patch: export-interrupt-func]
+	InterruptFunc = agentLoop.InterruptHard
+	// [aimemkb-patch: export-register-tool-func]
+	RegisterToolFunc = agentLoop.RegisterTool
 
 	fmt.Println("\n📦 Agent Status:")
 	startupInfo := agentLoop.GetStartupInfo()

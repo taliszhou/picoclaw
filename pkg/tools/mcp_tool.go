@@ -159,6 +159,7 @@ func (t *MCPTool) Parameters() map[string]any {
 
 	// Try direct conversion first (fast path)
 	if schemaMap, ok := schema.(map[string]any); ok {
+		ensureSchemaProperties(schemaMap)
 		return schemaMap
 	}
 
@@ -173,6 +174,7 @@ func (t *MCPTool) Parameters() map[string]any {
 	if jsonData != nil {
 		var result map[string]any
 		if err := json.Unmarshal(jsonData, &result); err == nil {
+			ensureSchemaProperties(result)
 			return result
 		}
 		// Fallback on error
@@ -205,7 +207,20 @@ func (t *MCPTool) Parameters() map[string]any {
 		}
 	}
 
+	ensureSchemaProperties(result)
 	return result
+}
+
+// ensureSchemaProperties ensures the schema has a "properties" key.
+// Some MCP servers return {"type":"object","additionalProperties":false}
+// without "properties", which strict OpenAI-compatible servers (e.g. LM Studio)
+// reject with 400 "expected object, received undefined".
+func ensureSchemaProperties(schema map[string]any) {
+	if schema["type"] == "object" {
+		if _, ok := schema["properties"]; !ok {
+			schema["properties"] = map[string]any{}
+		}
+	}
 }
 
 // Execute executes the MCP tool

@@ -351,6 +351,9 @@ func (r *ToolRegistry) ToProviderDefs() []providers.ToolDefinition {
 		name, _ := fn["name"].(string)
 		desc, _ := fn["description"].(string)
 		params, _ := fn["parameters"].(map[string]any)
+		if params == nil {
+			params = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
 
 		definitions = append(definitions, providers.ToolDefinition{
 			Type: "function",
